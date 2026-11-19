@@ -1,3 +1,41 @@
+<!-- gen:header -->
+<p align="center"><img src=".github/cover.svg" alt="Laboo · Tada" width="100%"></p>
+
+<h1 align="center">Laboo · Tada</h1>
+<p align="center"><b>ربات صورتکی سخن‌گو با ESP32-S3 و مغز هوش مصنوعی روی لپ‌تاپ</b><br><i>Talking face robot: ESP32-S3 touch LCD + Whisper + LLM brain</i></p>
+<p align="center"><img alt="ESP32-S3" src="https://img.shields.io/badge/-ESP32--S3-f43f5e?style=for-the-badge"> <img alt="Arduino" src="https://img.shields.io/badge/-Arduino-f43f5e?style=for-the-badge"> <img alt="Python" src="https://img.shields.io/badge/-Python-f43f5e?style=for-the-badge"> <img alt="Whisper" src="https://img.shields.io/badge/-Whisper-f43f5e?style=for-the-badge"> <img alt="Vosk" src="https://img.shields.io/badge/-Vosk-f43f5e?style=for-the-badge"> <img alt="LLM" src="https://img.shields.io/badge/-LLM-f43f5e?style=for-the-badge"></p>
+
+<div dir="rtl">
+
+## ✨ امکانات
+
+- صورت متحرک روی نمایشگر گرد ۱.۸۵ اینچ با لمس و میکروفون
+- شنیدن فارسی، فکر کردن با LLM و جواب با صدای فارسی
+- حافظه، دوربین و قابلیت‌های سرگرمی
+- فایل‌های SCAD و STL برای چاپ سه‌بعدی بدنه
+
+</div>
+
+## 📸 تصاویر · Screenshots
+
+<p align="center"><img src="faces_preview.png" width="49%" alt="screenshot"> </p>
+
+## 🚀 Quick start
+
+```bash
+flash.bat                     # flash the board
+cd pc && install.bat
+# put your API key in pc/config.yaml
+python laboo.py
+```
+
+> ℹ️ Arduino toolchain (`ext/`) and the Vosk Persian model (`pc/models/`) are not included — install the ESP32 core in Arduino IDE and download `vosk-model-fa-0.42` from alphacephei.com/vosk/models.
+
+---
+
+<!-- gen:docs -->
+## 📚 مستندات کامل · Full documentation
+
 # تادا — ربات صورتکی با ESP32-S3-Touch-LCD-1.85C
 
 ```
@@ -100,3 +138,8 @@
 ## توسعه‌ی بیشتر
 
 پروتکل USB ساده است و بالای `laboo_face.ino` توضیح داده شده. هر برنامه‌ای می‌تواند با فرستادن خط‌هایی مثل `E happy`، `S thinking`، `L 50 -20` یا `M 70` چهره را کنترل کند. برای حالت چهره‌ی جدید، یک ردیف به `PRESETS` در `face.cpp` اضافه کن.
+
+---
+
+<p align="center">ساخته‌شده توسط <a href="https://mahsen81.ir"><b>محسن جباره‌اصل</b></a> — برنامه‌نویسی، طراحی سایت، ربات و هوش مصنوعی<br>
+Built by <a href="https://mahsen81.ir">Mohsen Jabbareh-Asl</a> · ⭐ اگر مفید بود، ستاره بدهید · Need a custom version? <a href="https://mahsen81.ir">Get in touch</a></p>
