@@ -1,0 +1,126 @@
+# ====================== LABOO settings ======================
+
+robot:
+  name: "لبو"
+  # anything you want to add to its personality (Persian or English)
+  persona: "عاشق علم و تکنولوژی است و گاهی یک شوخی کوچک می‌کند."
+
+owner:                   # always given to Claude (edit freely)
+  name: "محسن"
+  facts:
+    - "اسم صاحبم محسن جباره‌اصل است و خودش من را ساخته (روی برد ESP32-S3 با صفحه‌ی گرد لمسی)."
+    - "محسن توسعه‌دهنده‌ی ارشد نرم‌افزار با بیش از ۱۷ سال تجربه‌ی برنامه‌نویسی است؛ فریلنسر است و طراحی سایت، بک‌اندهای مقیاس‌پذیر، وب سه‌بعدی تعاملی، هوش مصنوعی و یادگیری ماشین کار می‌کند (بیشتر TypeScript و Python)؛ سئو هم کار می‌کند."
+    - "از کارهای محسن: پلتفرم گردشگری درمانی «ایران هلت»، سیستم مدیریت انبار، سیستم مدیریت کلینیک و سیستم مدیریت کارها؛ گیت‌هابش mjpt1 است و وب‌سایتش mahsen81.ir."
+    - "در بیوی گیت‌هابش نوشته food lover؛ عاشق غذاست."
+    - "همسر محسن، مهسا است و محسن به او «عشق من» می‌گوید."
+    - "مهسا در کانادا زندگی می‌کند و از محسن دور است؛ محسن نمی‌تواند از نزدیک بغلش کند."
+    - "تولد مهسا ۵ شهریور ۱۳۶۳ ساعت ۸ صبح است و رنگ مورد علاقه‌اش صورتی است."
+    - "پسر محسن، کوروش، ۲۰ ساله است و خیلی به بازی‌های کامپیوتری علاقه دارد."
+
+gapgpt:                  # Iranian gateway (gapgpt.app): paid in rials, works without VPN
+  api_key: "YOUR_API_KEY"            # your GapGPT key
+  base_url: "https://api.gapgpt.app/v1"
+  model: "gpt-4o-mini"   # fastest in your test (2.4 s). smarter but slow (9 s): claude-sonnet-5-5
+
+ollama:                  # local brain on this laptop: no key, no internet (install: ollama.com)
+  base_url: "http://localhost:11434/v1"
+  model: "gemma3:4b"     # knows Persian; faster but weaker: "gemma3:1b" | smarter but slow here: "qwen3:8b"
+  timeout: 300           # first load of the model can take ~2.5 min on this laptop
+
+claude:
+  provider: gapgpt        # gapgpt = via GapGPT (rials) | ollama = offline on this laptop | anthropic = Claude directly
+  fallback: ollama        # no internet -> the local model answers
+  api_key: "YOUR_API_KEY"            # sk-ant-...   (or set the ANTHROPIC_API_KEY environment variable)
+  model: "claude-haiku-4-5-20251001"   # fast & cheap. smarter: "claude-sonnet-5"
+  base_url: ""           # leave empty (only for a relay/proxy address)
+  max_tokens: "YOUR_API_KEY"
+  web_search: true       # lets Tada search the internet for news, prices, weather... (about $0.01 per search)
+  web_search_max: 2      # max searches per question
+  history_messages: 24   # recent messages kept word-for-word; older ones become a summary
+
+stt:                     # speech -> text
+  engine: vosk           # vosk = offline, fast (recommended)  |  gapgpt = Whisper via GapGPT (was 40 s in your test)
+  vosk_model: small      # small = fast (~1 s) | big = more accurate but ~10 s on this laptop
+  local_model: "large-v3-turbo"   # best Persian. faster but weaker: "medium" or "small"
+  wake_model: "small"             # small fast model that only listens for its name
+  beam_size: 1           # 1 = fastest; 3-5 = a bit more accurate but slower
+  cpu_threads: 0         # 0 = use all CPU cores
+  language: fa
+  languages: [fa]        # English model misheard Persian ("abu"); add en back if you talk English to it
+  vosk_model_en: small   # English model: small (fast) | big (slow)
+  # only used when engine: api  (any OpenAI-compatible Whisper endpoint, e.g. Groq free tier)
+  api_base_url: "https://api.groq.com/openai/v1"
+  api_key: ""
+  api_model: "whisper-large-v3"
+
+piper:                   # offline Persian voice (pc/models/piper)
+  voice: "fa_IR-amir-medium"   # or "fa_IR-gyro-medium"
+  speed: 1.05
+
+tts:                     # text -> voice
+  engine: piper          # piper = offline | edge = free Microsoft voices (internet) | gapgpt = OpenAI voice via GapGPT
+  gapgpt_model: "gpt-4o-mini-tts"
+  gapgpt_voice: "nova"   # try: nova, shimmer, coral, alloy, sage, ash, echo, fable, onyx
+  voice: "fa-IR-FaridNeural"      # male.  female: "fa-IR-DilaraNeural"
+  voice_en: "en-US-AnaNeural"     # English voice (Ana = child-like). others: en-US-AndrewNeural, en-US-GuyNeural
+  rate: "+5%"
+  pitch: "+25Hz"         # higher = cuter robot voice
+  pronounce: {"لبو": "لَبو"}          # fix how the voice says a word, e.g. {"لبو": "لَبو"}
+
+listen:
+  mode: wake             # wake = call it by name   |   tap = only by tapping   |   always = answers everything it hears
+  wake_words: ["لبو", "لبوو"]   # only the name itself; other names get "my name is لبو"
+  fast_wake: true        # instant name spotting with a small offline model (Vosk); false = use Whisper (slower)
+  follow_up_seconds: 6   # after answering, keeps listening this long so you can continue without its name
+  mic_source: board      # board = the mic on the robot   |   laptop = the laptop's mic
+  end_silence: 1.0       # seconds of silence that end your sentence
+  max_seconds: 15
+  no_speech_timeout: 7
+  min_level: 600         # (after mic_gain) raise it if background noise starts recordings by itself
+  mic_gain: 4            # board mic is quiet; louder = Vosk understands better
+
+camera:                  # laptop webcam: Tada follows your face with its eyes and reacts to your expression
+  enabled: true
+  index: 0               # 0 = built-in camera; try 1 if you have another one
+  follow_eyes: true      # eyes follow your face
+  mirror: true           # if the eyes look the WRONG way, set false
+  fps: 6                 # frames per second it looks (lower = less CPU)
+  mood_threshold: 0.55   # how sure it must be before reacting (higher = fewer reactions)
+  mood_hold_seconds: 1.5 # your expression must last this long
+  frown_sensitivity: 0.12 # lower = notices a smaller frown (0.06 very sensitive, 0.15 only big frowns)
+  away_minutes: 5        # when you come back after this long, it greets you with a happy face
+  react: {}              # change reactions, e.g. {anger: angry, sadness: love}
+                         # your faces: happiness sadness surprise anger fear disgust contempt
+                         # its faces : neutral happy sad angry surprised love confused sleepy
+
+screen:                  # pictures on the round screen when nobody is talking to it (needs the new firmware)
+  enabled: true
+  idle_minutes: 1.5      # after this long without talking/touching, the clock appears
+  persian_digits: true
+  brightness: 80
+  night_brightness: 15
+  night_hours: [23, 7]   # dim + softer colours between these hours
+  photos_folder: photos  # put pictures in pc/photos -> swipe on the clock to see them
+  photo_seconds: 20
+
+weather:                 # open-meteo.com, free, no key. Change to your own city:
+  city: "تهران"
+  lat: 35.6892
+  lon: 51.3890
+
+apps:                    # programs it may open when you ask ("کروم رو باز کن")
+  chrome: chrome
+  notepad: notepad
+  calculator: calc
+  explorer: explorer
+  vscode: code
+  telegram: telegram
+
+wellbeing:
+  morning_greeting: true       # first time it sees you in the morning: hello + weather
+  break_after_minutes: 50      # sitting this long in front of the camera -> "take a break" (0 = off)
+  special_days:                # Persian calendar month-day
+    - {date: "06-05", text: "راستی امروز تولد مهساست! یادت نره تبریک بگی."}
+
+serial:
+  port: auto             # or e.g. COM5

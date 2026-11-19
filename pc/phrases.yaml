@@ -1,0 +1,45 @@
+# ============ Your own sentences for Labo ============
+# When you say one of the "q" sentences (roughly, it doesn't have to be exact),
+# Labo answers with "a" immediately, without asking Claude.
+# emotion: neutral happy sad angry surprised love confused sleepy
+# Edit this file with Notepad and restart run.bat.
+
+- q: ["سلام", "سلام لبو", "درود"]
+  a: "سلام محسن جان! چه خبر؟"
+  emotion: happy
+
+- q: ["خوبی", "چطوری", "حالت خوبه"]
+  a: "من عالی‌ام! تو چطوری؟"
+  emotion: happy
+
+- q: ["اسمت چیه", "تو کی هستی"]
+  a: "من لبوام، ربات کوچولوی محسن!"
+  emotion: happy
+
+- q: ["شب بخیر", "من دارم میرم بخوابم"]
+  a: "شب بخیر محسن جان، خوب بخوابی!"
+  emotion: sleepy
+
+- q: ["دوستت دارم"]
+  a: "منم خیلی دوستت دارم!"
+  emotion: love
+
+- q: ["خداحافظ", "فعلا", "بای"]
+  a: "خداحافظ! زود برگرد."
+  emotion: sad
+
+- q: ["عصبانی شو", "داد بزن"]
+  a: "ای بابا! چرا من رو اذیت می‌کنی؟!"
+  emotion: angry
+
+- q: ["hello", "hi", "hey", "hello labo", "hi labo"]
+  a: "Hi Mohsen! How are you?"
+  emotion: happy
+
+- q: ["how are you", "how are you doing"]
+  a: "I'm great, thanks! And you?"
+  emotion: happy
+
+- q: ["what is your name", "who are you"]
+  a: "I'm Labo, Mohsen's little robot!"
+  emotion: happy

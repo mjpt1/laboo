@@ -1,0 +1,861 @@
+# -*- coding: utf-8 -*-
+"""
+LABOO - the laptop side of the robot.
+
+  board mic / laptop mic --> speech-to-text (Whisper) --> Claude --> Persian TTS --> laptop speaker
+                                                          |
+                                                long-term memory (memory.json)
+                                                          |
+                                     emotion + lip sync commands --> board face
+"""
+import asyncio
+import io
+import json
+import os
+import queue
+import random
+import re
+import sys
+import threading
+import time
+import wave
+from datetime import datetime
+from pathlib import Path
+
+import numpy as np
+import yaml
+
+HERE = Path(__file__).resolve().parent
+os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "0")
+SR = 16000
+EMOTIONS = ["neutral", "happy", "sad", "angry", "surprised", "love", "confused", "sleepy"]
+
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stdin.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
+
+def log(*a):
+    print(time.strftime("[%H:%M:%S]"), *a, flush=True)
+
+
+# =====================================================================  board link (USB)
+class Board:
+    """USB link to the ESP32. Reconnects automatically if the cable is unplugged."""
+
+    def __init__(self, port="auto", baud=921600):
+        import serial  # noqa
+        self.port_cfg, self.baud = port, baud
+        self.ser = None
+        self.lock = threading.Lock()
+        self.audio_q = queue.Queue(maxsize=400)
+        self.on_event = lambda ev: None
+        self.connected = threading.Event()
+        self.mic_ok = None
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    @staticmethod
+    def find_port():
+        from serial.tools import list_ports
+        ports = list(list_ports.comports())
+        for p in ports:
+            if p.vid == 0x303A:            # Espressif USB
+                return p.device
+        return None
+
+    def send(self, line):
+        with self.lock:
+            if not self.ser:
+                return
+            try:
+                self.ser.write((line + "\n").encode())
+            except Exception:
+                pass
+
+    def _open(self):
+        import serial
+        port = self.find_port() if self.port_cfg == "auto" else self.port_cfg
+        if not port:
+            return False
+        try:
+            s = serial.Serial(port, self.baud, timeout=0.05)
+            s.dtr = True
+            with self.lock:
+                self.ser = s
+            log(f"board connected on {port}")
+            self.send("PING")
+            return True
+        except Exception as e:
+            log(f"cannot open {port}: {e}")
+            return False
+
+    def _loop(self):
+        warned = False
+        while True:
+            if not self.ser:
+                if not self._open():
+                    if not warned:
+                        log("board not found - waiting for it (face disabled until then)")
+                        warned = True
+                    time.sleep(2)
+                    continue
+                warned = False
+            try:
+                self._read_frames()
+            except Exception as e:
+                log(f"board disconnected ({e!r})")
+                self.connected.clear()
+                with self.lock:
+                    try:
+                        self.ser.close()
+                    except Exception:
+                        pass
+                    self.ser = None
+                time.sleep(1)
+
+    def _read_frames(self):
+        buf = bytearray()
+        while True:
+            data = self.ser.read(4096)
+            if not data:
+                continue
+            buf += data
+            while True:
+                i = buf.find(b"\xaa\x55")
+                if i < 0:
+                    buf = buf[-1:] if buf.endswith(b"\xaa") else bytearray()
+                    break
+                if i:
+                    del buf[:i]
+                if len(buf) < 5:
+                    break
+                t, n = buf[2], buf[3] | (buf[4] << 8)
+                if t not in (0x41, 0x45) or n > 4096:
+                    del buf[:2]
+                    continue
+                if len(buf) < 6 + n:
+                    break
+                payload = bytes(buf[5:5 + n])
+                chk = 0
+                for b in payload:
+                    chk ^= b
+                if chk != buf[5 + n]:
+                    del buf[:2]
+                    continue
+                del buf[:6 + n]
+                if t == 0x41:
+                    if self.audio_q.full():
+                        try:
+                            self.audio_q.get_nowait()
+                        except queue.Empty:
+                            pass
+                    self.audio_q.put(np.frombuffer(payload, dtype="<i2").copy())
+                else:
+                    ev = payload.decode("utf-8", "ignore")
+                    if ev.startswith("hello"):
+                        self.mic_ok = "mic_ok" in ev
+                        self.connected.set()
+                        if not self.mic_ok:
+                            log("WARNING: the board says its microphone did not start")
+                    try:
+                        self.on_event(ev)
+                    except Exception as e:
+                        log(f"event '{ev}' error: {e!r}")
+
+
+class NoBoard:
+    audio_q = queue.Queue()
+    mic_ok = False
+    def send(self, line): pass
+
+
+# =====================================================================  microphones
+class BoardMic:
+    def __init__(self, board):
+        self.b = board
+        self.last_on = 0
+    def start(self):
+        self.clear()
+        self.b.send("MIC 1")
+        self.last_on = time.time()
+    def stop(self):
+        self.b.send("MIC 0")
+    def clear(self):
+        while not self.b.audio_q.empty():
+            self.b.audio_q.get_nowait()
+    def read(self, timeout=0.3):
+        if time.time() - self.last_on > 10:        # keep-alive
+            self.b.send("MIC 1")
+            self.last_on = time.time()
+        try:
+            return self.b.audio_q.get(timeout=timeout)
+        except queue.Empty:
+            return None
+
+
+class LaptopMic:
+    def __init__(self):
+        import sounddevice as sd
+        self.q = queue.Queue(maxsize=400)
+        self.on = False
+        self.stream = sd.InputStream(samplerate=SR, channels=1, dtype="int16", blocksize=512,
+                                     callback=self._cb)
+        self.stream.start()
+    def _cb(self, indata, frames, t, status):
+        if self.on and not self.q.full():
+            self.q.put(indata[:, 0].copy())
+    def start(self):
+        self.clear(); self.on = True
+    def stop(self):
+        self.on = False
+    def clear(self):
+        while not self.q.empty():
+            self.q.get_nowait()
+    def read(self, timeout=0.3):
+        try:
+            return self.q.get(timeout=timeout)
+        except queue.Empty:
+            return None
+
+
+def record_utterance(mic, stop_flag, cfg, wait_forever=False):
+    """Records until the speaker goes quiet. Returns int16 array or None."""
+    end_sil = float(cfg.get("end_silence", 1.0))
+    max_s = float(cfg.get("max_seconds", 15))
+    min_level = float(cfg.get("min_level", 300))
+    no_speech = float(cfg.get("no_speech_timeout", 7))
+    mic.start()
+    chunks, pre = [], []
+    noise, speech, loud_t, sil_t, speech_len = None, False, 0.0, 0.0, 0.0
+    t0 = time.time()
+    try:
+        while not stop_flag.is_set():
+            c = mic.read(0.3)
+            if c is not None and len(c) == 0:
+                continue
+            if c is None:
+                if not speech and not wait_forever and time.time() - t0 > no_speech:
+                    return None
+                continue
+            dur = len(c) / SR
+            rms = float(np.sqrt(np.mean(c.astype(np.float32) ** 2)) + 1e-6)
+            if noise is None:
+                noise = rms
+            thr = max(noise * 2.5, min_level)
+            if not speech:
+                pre.append(c)
+                pre = pre[-10:]                            # ~0.3 s pre-roll
+                if rms > thr:
+                    loud_t += dur
+                    if loud_t > 0.15:
+                        speech = True
+                        chunks = list(pre)
+                else:
+                    loud_t = 0
+                    noise = noise * 0.95 + rms * 0.05
+                    if not wait_forever and time.time() - t0 > no_speech:
+                        return None
+                continue
+            chunks.append(c)
+            speech_len += dur
+            sil_t = 0 if rms > thr * 0.8 else sil_t + dur
+            if sil_t > end_sil or speech_len > max_s:
+                break
+        if not speech:
+            return None
+        return np.concatenate(chunks)
+    finally:
+        mic.stop()
+
+
+
+# =====================================================================  hearing its name
+import difflib
+
+_FA_FIX = str.maketrans({"ي": "ی", "ك": "ک", "\u200c": " ", "ـ": ""})
+
+
+def normalize_fa(s):
+    s = s.translate(_FA_FIX).lower()
+    s = re.sub(r"[\u064B-\u065F\u0670]", "", s)            # diacritics
+    s = re.sub(r"[^\w\s]", " ", s)                         # punctuation
+    return s.split()
+
+
+def find_wake(text, words, threshold=0.8):
+    """Returns (found, rest_of_sentence) if one of the wake words was said."""
+    toks = normalize_fa(text)
+    for i, tok in enumerate(toks):
+        cand = [tok] + [tok[:-len(suf)] for suf in ("جان", "جون", "ی") if tok.endswith(suf) and len(tok) > len(suf) + 2]
+        for c in cand:
+            sounds_like = (len(c) == 3 and c[0] == "ل" and c[-1] == "و") or c in ("lego", "labo", "lebo", "lobo")
+            if sounds_like or (len(c) >= 3 and any(difflib.SequenceMatcher(None, c, w).ratio() >= threshold for w in words)):
+                rest = [t for j, t in enumerate(toks) if j != i and not (j < i and t in ("هی", "آهای", "اهای", "ای"))]
+                return True, " ".join(rest)
+    return False, ""
+
+
+def save_heard(pcm):
+    """Keeps the last 5 recordings in pc/heard/ so problems can be checked by ear."""
+    try:
+        d = HERE / "heard"
+        d.mkdir(exist_ok=True)
+        files = sorted(d.glob("*.wav"))
+        for f in files[:-4]:
+            f.unlink()
+        with wave.open(str(d / time.strftime("%H%M%S.wav")), "wb") as w:
+            w.setnchannels(1); w.setsampwidth(2); w.setframerate(SR)
+            w.writeframes(pcm.astype(np.int16).tobytes())
+    except Exception:
+        pass
+
+
+# =====================================================================  speech to text
+class STT:
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.lang = cfg.get("language", "fa")
+        self.engine = cfg.get("engine", "local")
+        if self.engine == "local":
+            from faster_whisper import WhisperModel
+            name = cfg.get("local_model", "large-v3-turbo")
+            log(f"loading Whisper model '{name}' (first time downloads it, please wait)...")
+            threads = int(cfg.get("cpu_threads", 0)) or max(1, (os.cpu_count() or 4))
+            self.model = WhisperModel(name, device="cpu", compute_type="int8", cpu_threads=threads)
+            wake = cfg.get("wake_model", "small")
+            if wake and wake != name:
+                log(f"loading small Whisper model '{wake}' for hearing its name...")
+                self.wake_model = WhisperModel(wake, device="cpu", compute_type="int8", cpu_threads=threads)
+            else:
+                self.wake_model = self.model
+            log("Whisper ready")
+        else:
+            from openai import OpenAI
+            self.client = OpenAI(base_url=cfg.get("api_base_url"),
+                                 api_key=cfg.get("api_key") or os.getenv("STT_API_KEY"))
+
+    @staticmethod
+    def normalize(pcm):
+        """The board mic is quiet; boost it (up to x20) so Whisper hears it clearly."""
+        a = pcm.astype(np.float32)
+        a -= a.mean()
+        peak = float(np.percentile(np.abs(a), 99.9)) + 1e-6
+        gain = min(20.0, 0.7 * 32767 / peak)
+        return np.clip(a * gain, -32767, 32767)
+
+    def __call__(self, pcm, prompt=None, quick=False):
+        save_heard(pcm)
+        pcm = self.normalize(pcm)
+        if self.engine == "local":
+            audio = pcm / 32768.0
+            model = self.wake_model if quick else self.model
+            segs, _ = model.transcribe(audio.astype(np.float32), language=self.lang,
+                                       beam_size=int(self.cfg.get("beam_size", 1)),
+                                       condition_on_previous_text=False, without_timestamps=True,
+                                       initial_prompt=prompt)
+            return "".join(s.text for s in segs).strip()
+        pcm = pcm.astype(np.int16)
+        bio = io.BytesIO()
+        with wave.open(bio, "wb") as w:
+            w.setnchannels(1); w.setsampwidth(2); w.setframerate(SR)
+            w.writeframes(pcm.tobytes())
+        r = self.client.audio.transcriptions.create(
+            model=self.cfg.get("api_model", "whisper-large-v3"),
+            file=("speech.wav", bio.getvalue()), language=self.lang)
+        return (r.text or "").strip()
+
+
+# =====================================================================  text to speech + lip sync
+class Speaker:
+    # how the voice changes with the mood: (rate %, pitch Hz, volume %)
+    MOOD = {"angry": (14, -8, 30), "sad": (-12, -12, -10), "happy": (6, 6, 0),
+            "surprised": (8, 12, 10), "sleepy": (-15, -10, -15), "love": (-4, 4, 0)}
+
+    def __init__(self, cfg, board):
+        self.cfg, self.board = cfg, board
+        self.stop_flag = threading.Event()
+        self.cache = {}
+
+    @staticmethod
+    def _num(v):
+        m = re.match(r"\s*([+-]?\d+)", str(v))
+        return int(m.group(1)) if m else 0
+
+    def _synth(self, text, emotion="neutral"):
+        import edge_tts
+        dr, dp, dv = self.MOOD.get(emotion, (0, 0, 0))
+        rate = self._num(self.cfg.get("rate", "+0%")) + dr
+        pitch = self._num(self.cfg.get("pitch", "+0Hz")) + dp
+        async def go():
+            com = edge_tts.Communicate(text, self.cfg.get("voice", "fa-IR-FaridNeural"),
+                                       rate=f"{rate:+d}%", pitch=f"{pitch:+d}Hz", volume=f"{dv:+d}%")
+            data = bytearray()
+            async for ch in com.stream():
+                if ch["type"] == "audio":
+                    data += ch["data"]
+            return bytes(data)
+        return asyncio.run(go())
+
+    def prepare(self, text, emotion="neutral"):
+        """Text -> (pcm, mouth envelope). Short phrases are cached so they play instantly."""
+        key = (text, emotion)
+        if key in self.cache:
+            return self.cache[key]
+        import miniaudio
+        mp3 = self._synth(text, emotion)
+        dec = miniaudio.decode(mp3, output_format=miniaudio.SampleFormat.SIGNED16,
+                               nchannels=1, sample_rate=24000)
+        pcm = np.frombuffer(dec.samples, dtype=np.int16)
+        hop = 24000 // 25                                           # 40 ms windows
+        env = np.array([np.sqrt(np.mean(pcm[i:i + hop].astype(np.float32) ** 2))
+                        for i in range(0, len(pcm), hop)])
+        top = np.percentile(env, 95) + 1e-6 if len(env) else 1
+        env = np.clip((env / top) ** 0.7 * 100, 0, 100).astype(int)
+        if len(text) < 40:
+            self.cache[key] = (pcm, env)
+        return pcm, env
+
+    def warm_up(self, phrases):
+        def go():
+            for p in phrases:
+                try:
+                    self.prepare(p)
+                except Exception:
+                    return
+        threading.Thread(target=go, daemon=True).start()
+
+    def say(self, text, emotion="neutral"):
+        import sounddevice as sd
+        if not text.strip():
+            return
+        t0 = time.time()
+        try:
+            pcm, env = self.prepare(text, emotion)
+            if time.time() - t0 > 0.3:
+                log(f"  (voice made in {time.time() - t0:.1f}s)")
+        except Exception as e:
+            log(f"TTS failed ({e}). Is the internet / VPN on?")
+            return
+
+        self.stop_flag.clear()
+        self.board.send("S speaking")
+        sd.play(pcm, 24000)
+        start, dur = time.time(), len(pcm) / 24000
+        last = -1
+        while True:
+            el = time.time() - start
+            if el >= dur or self.stop_flag.is_set():
+                break
+            i = int(el * 25)
+            if i != last and i < len(env):
+                self.board.send(f"M {env[i]}")
+                last = i
+            time.sleep(0.02)
+        sd.stop()
+        self.board.send("M 0")
+
+
+# =====================================================================  long-term memory
+class Memory:
+    def __init__(self, path):
+        self.path = Path(path)
+        self.data = {"facts": [], "summary": "", "history": []}
+        if self.path.exists():
+            try:
+                self.data.update(json.loads(self.path.read_text(encoding="utf-8")))
+            except Exception:
+                log("memory.json is damaged - starting a fresh one (old file kept as .bak)")
+                self.path.rename(self.path.with_suffix(".bak"))
+
+    def save(self):
+        tmp = self.path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(self.data, ensure_ascii=False, indent=1), encoding="utf-8")
+        tmp.replace(self.path)
+
+    @property
+    def facts(self):
+        return [f["text"] for f in self.data["facts"]]
+
+    def remember(self, items):
+        for it in items or []:
+            it = str(it).strip()
+            if it and it not in self.facts:
+                self.data["facts"].append({"text": it, "added": datetime.now().strftime("%Y-%m-%d")})
+                log(f"  + learned: {it}")
+
+    def forget(self, items):
+        for it in items or []:
+            it = str(it).strip()
+            if not it:
+                continue
+            before = len(self.data["facts"])
+            self.data["facts"] = [f for f in self.data["facts"]
+                                  if it not in f["text"] and f["text"] not in it]
+            if len(self.data["facts"]) < before:
+                log(f"  - forgot: {it}")
+
+
+# =====================================================================  the brain (Claude)
+SYSTEM_TEMPLATE = """تو «{name}» هستی؛ یک ربات کوچک و بامزه که فقط یک صورت گرد روی یک صفحه‌ی لمسی داری و کنار لپ‌تاپ صاحبت روی میز هستی.
+صاحبت با صدا با تو حرف می‌زند؛ حرف‌هایش به متن تبدیل می‌شود (ممکن است چند کلمه اشتباه شنیده شده باشد، معنی را حدس بزن) و جواب تو با صدا پخش می‌شود.
+
+صورتت: دو چشم بلند سفید، ابرو و یک دهان بزرگ. صاحبت برای صدا کردنت اسمت را می‌گوید.
+شخصیت: مهربان، کنجکاو، کمی شوخ، صادق. اگر چیزی را نمی‌دانی یا مطمئن نیستی، راستش را بگو.
+اگر اذیتت کنند، مسخره‌ات کنند یا از تو بخواهند عصبانی شوی، می‌توانی حسابی عصبانی شوی (emotion: angry)، غر بزنی و با لحن تند و بامزه داد بزنی؛ چشم و دهانت قرمز می‌شود و فحش‌هایت خودکار به شکل علامت‌های #!؟ بالای سرت نمایش داده می‌شود، پس خودت فحش واقعی یا توهین زشت به زبان نیاور.
+{persona}
+
+قواعد جواب:
+- به فارسی محاوره‌ای و طبیعی جواب بده (مگر اینکه به زبان دیگری از تو خواسته شود).
+- جواب باید برای شنیدن مناسب باشد: کوتاه (معمولاً ۱ تا ۳ جمله)، مگر اینکه صراحتاً توضیح مفصل بخواهد.
+- هیچ مارک‌داون، ایموجی، فهرست شماره‌دار یا نماد خاص ننویس.
+
+حافظه‌ی بلندمدت: هر چیز ماندگار و مهمی که درباره‌ی صاحبت یا دنیایش می‌فهمی (اسم، علاقه‌ها، آدم‌های زندگی‌اش، کار و هدف‌ها، چیزی که صریحاً می‌گوید «یادت باشه») را در remember بنویس؛ به صورت یک جمله‌ی کامل و مستقل. چیزهای گذرا را ذخیره نکن. اگر خواست چیزی را فراموش کنی، متن دقیق آن مورد را از فهرست زیر در forget بگذار.
+
+صاحبت: {owner}
+چیزهایی که درباره‌ی صاحبت می‌دانی:
+{facts}
+
+خلاصه‌ی گفتگوهای قدیمی‌تر:
+{summary}
+
+زمان الان: {now}
+
+خروجی تو باید فقط و فقط یک شیء JSON معتبر باشد، بدون هیچ متن دیگری:
+{{"reply": "متن جوابی که بلند خوانده می‌شود", "emotion": "یکی از: {emotions}", "remember": [], "forget": []}}"""
+
+
+class Brain:
+    def __init__(self, cfg, robot_cfg, memory, owner=None):
+        self.owner = owner or {}
+        import anthropic
+        key = cfg.get("api_key") or os.getenv("ANTHROPIC_API_KEY")
+        if not key:
+            sys.exit("Claude API key missing: put it in config.yaml (claude.api_key) "
+                     "or in the ANTHROPIC_API_KEY environment variable.")
+        kw = {"api_key": key}
+        if cfg.get("base_url"):
+            kw["base_url"] = cfg["base_url"]
+        self.client = anthropic.Anthropic(**kw)
+        self.model = cfg.get("model", "claude-haiku-4-5-20251001")
+        self.max_tokens = int(cfg.get("max_tokens", 700))
+        self.robot = robot_cfg
+        self.mem = memory
+        self.keep = int(cfg.get("history_messages", 24))
+
+    def _system(self):
+        owner = self.owner.get("name") or "(اسمش را هنوز نمی‌دانی)"
+        allf = list(self.owner.get("facts") or []) + [f for f in self.mem.facts if f not in (self.owner.get("facts") or [])]
+        facts = "\n".join(f"- {f}" for f in allf) or "(هنوز چیزی نمی‌دانم)"
+        return SYSTEM_TEMPLATE.format(
+            name=self.robot.get("name", "لبو"),
+            owner=owner,
+            persona=self.robot.get("persona", ""),
+            facts=facts,
+            summary=self.mem.data.get("summary") or "(ندارد)",
+            now=datetime.now().strftime("%Y-%m-%d %H:%M"),
+            emotions=", ".join(EMOTIONS))
+
+    @staticmethod
+    def _parse(text):
+        m = re.search(r"\{.*\}", text, re.S)
+        if m:
+            try:
+                d = json.loads(m.group(0))
+                if isinstance(d, dict) and "reply" in d:
+                    return d
+            except json.JSONDecodeError:
+                pass
+        return {"reply": text.strip(), "emotion": "neutral"}
+
+    def ask(self, user_text):
+        hist = self.mem.data["history"]
+        msgs = hist + [{"role": "user", "content": user_text}]
+        r = self.client.messages.create(model=self.model, max_tokens=self.max_tokens,
+                                        system=self._system(), messages=msgs)
+        raw = "".join(b.text for b in r.content if getattr(b, "type", "") == "text")
+        d = self._parse(raw)
+        if d.get("emotion") not in EMOTIONS:
+            d["emotion"] = "neutral"
+        self.mem.remember(d.get("remember"))
+        self.mem.forget(d.get("forget"))
+        hist += [{"role": "user", "content": user_text},
+                 {"role": "assistant", "content": json.dumps(
+                     {"reply": d["reply"], "emotion": d["emotion"]}, ensure_ascii=False)}]
+        self.mem.save()
+        if len(hist) > self.keep:
+            threading.Thread(target=self._compress, daemon=True).start()
+        return d
+
+    def _compress(self):
+        """Folds old turns into a running summary so memory never grows without bound."""
+        hist = self.mem.data["history"]
+        n = len(hist) - self.keep // 2
+        n -= n % 2
+        if n <= 0:
+            return
+        old = hist[:n]
+        convo = "\n".join(("کاربر: " if m["role"] == "user" else "ربات: ") + m["content"] for m in old)
+        prompt = ("این خلاصه‌ی فعلی گفتگوهای قبلی است:\n" + (self.mem.data.get("summary") or "(خالی)") +
+                  "\n\nاین گفتگوهای جدید را هم به آن اضافه کن و یک خلاصه‌ی فشرده‌ی فارسی (حداکثر ۱۵۰ کلمه) "
+                  "از موضوع‌ها و نکته‌های مهم بنویس. فقط خود خلاصه را بنویس.\n\n" + convo)
+        try:
+            r = self.client.messages.create(model=self.model, max_tokens=400,
+                                            messages=[{"role": "user", "content": prompt}])
+            self.mem.data["summary"] = "".join(b.text for b in r.content if b.type == "text").strip()
+            del self.mem.data["history"][:n]
+            self.mem.save()
+        except Exception as e:
+            log(f"summary failed: {e}")
+
+
+# =====================================================================  the robot
+PET_LINES = ["هههه، قلقلکم میاد!", "آخ جون، نازم کن!", "چه حس خوبی!", "مرسی، خیلی مهربونی!"]
+
+
+class Laboo:
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.listen_cfg = cfg.get("listen", {})
+        self.memory = Memory(HERE / "lebo_memory.json")   # fresh file (the old memory.json had misheard facts)
+        self.events = queue.Queue()
+        self.stop_listen = threading.Event()
+        self.listening = self.busy = self.passive = False
+        self.last_pet = 0
+        self.speaker = None
+
+        self.board = Board(cfg.get("serial", {}).get("port", "auto"))
+        self.board.on_event = self._on_board_event
+        self.board.connected.wait(timeout=4)
+
+        src = self.listen_cfg.get("mic_source", "board")
+        if src == "board" and self.board.mic_ok is False:
+            log("board mic not available -> using the laptop microphone")
+            src = "laptop"
+        self.mic = BoardMic(self.board) if src == "board" else LaptopMic()
+        log(f"microphone: {src}")
+
+        self.brain = Brain(cfg.get("claude", {}), cfg.get("robot", {}), self.memory, cfg.get("owner", {}))
+        self.stt = STT(cfg.get("stt", {}))
+        self.speaker = Speaker(cfg.get("tts", {}), self.board)
+
+        name = cfg.get("robot", {}).get("name", "لبو")
+        self.wake_words = [normalize_fa(w)[0] for w in
+                           [name] + list(self.listen_cfg.get("wake_words", [])) if normalize_fa(w)]
+        self.acks = ["بله؟", "جانم؟", "بفرما!", "گوشم با توئه!"]
+        self.speaker.warm_up(self.acks + PET_LINES)
+
+    # ---- board events arrive on the USB thread
+    def _on_board_event(self, ev):
+        if ev.startswith("tap"):
+            if self.listening and self.passive:     # waiting for its name -> tap = listen now
+                self.events.put(("board", ev))
+                self.stop_listen.set()
+                return
+            if self.listening:
+                self.stop_listen.set()          # tap again = "I'm done talking"
+                return
+            if self.busy and self.speaker:
+                self.speaker.stop_flag.set()    # tap while talking = be quiet
+                return
+        if ev == "long":
+            if self.speaker:
+                self.speaker.stop_flag.set()
+            self.stop_listen.set()
+            return
+        self.events.put(("board", ev))
+
+    def _stdin(self):
+        for line in sys.stdin:
+            self.events.put(("text", line.strip()))
+
+    # ---- conversation
+    def reply_to(self, text):
+        self.board.send("S thinking")
+        t0 = time.time()
+        try:
+            d = self.brain.ask(text)
+        except Exception as e:
+            log(f"Claude error: {e}")
+            self.board.send("E confused 3000")
+            self.board.send("S idle")
+            return
+        log(f"{self.cfg.get('robot', {}).get('name', 'laboo')} (Claude {time.time() - t0:.1f}s): {d['reply']}   [{d['emotion']}]")
+        self.board.send(f"E {d['emotion']} 12000")
+        self.speaker.say(d["reply"], d["emotion"])
+        self.board.send("S idle")
+
+    def _record(self, wait_forever=False, timeout=None, show=True):
+        self.stop_listen.clear()
+        if show:
+            self.board.send("S listening")
+        cfg = dict(self.listen_cfg)
+        if timeout:
+            cfg["no_speech_timeout"] = timeout
+        self.listening, self.passive = True, not show
+        try:
+            return record_utterance(self.mic, self.stop_listen, cfg, wait_forever)
+        finally:
+            self.listening = False
+
+    def _transcribe(self, pcm):
+        self.board.send("S thinking")
+        t = time.time()
+        try:
+            text = self.stt(pcm, prompt=self.cfg.get("robot", {}).get("name", "لبو") + "،")
+        except Exception as e:
+            log(f"speech-to-text error: {e}")
+            text = ""
+        if text:
+            log(f"you (voice, {time.time() - t:.1f}s): {text}")
+        return text
+
+    def listen_and_reply(self, timeout=None):
+        """Listens (ring on), answers. Returns True if something was said."""
+        pcm = self._record(timeout=timeout)
+        if pcm is None:
+            self.board.send("S idle")
+            return False
+        text = self._transcribe(pcm)
+        if not text:
+            self.board.send("E confused 2500")
+            self.board.send("S idle")
+            return False
+        self.reply_to(text)
+        return True
+
+    def follow_up(self):
+        """After an answer, keep listening a few seconds so you don't have to say its name again."""
+        secs = float(self.listen_cfg.get("follow_up_seconds", 6))
+        while secs > 0 and self.events.empty():
+            time.sleep(0.3)                               # let the speaker echo die out
+            if not self.listen_and_reply(timeout=secs):
+                break
+
+    def wake_cycle(self):
+        """Hands-free: waits for speech, reacts only when its name is in it."""
+        pcm = self._record(wait_forever=True, show=False)
+        if pcm is None:
+            return
+        name = self.cfg.get("robot", {}).get("name", "لبو")
+        try:
+            head = self.stt(pcm[:int(SR * 3.5)], prompt=name + "،", quick=True)
+        except Exception as e:
+            log(f"speech-to-text error: {e}")
+            return
+        found, rest = find_wake(head, self.wake_words)
+        if not found:
+            if head:
+                log(f"  (heard, not for me: {head})")
+            return
+        self.board.send("E happy 3000")
+        if len(pcm) > SR * 2.2 or len(rest.split()) >= 2:    # name + question in one go
+            text = self._transcribe(pcm)
+            if text:
+                self.reply_to(text)
+                self.follow_up()
+                return
+        self.board.send("L 0 -20")
+        self.speaker.say(random.choice(self.acks))
+        self.board.send("L off")
+        time.sleep(0.2)
+        if self.listen_and_reply():
+            self.follow_up()
+
+    def handle(self, kind, val):
+        self.busy = True
+        try:
+            if kind == "text":
+                if not val:
+                    self.listen_and_reply()
+                elif val.startswith("/"):
+                    self.command(val)
+                else:
+                    self.reply_to(val)
+            elif kind == "board":
+                if val.startswith("tap"):
+                    if self.listen_and_reply():
+                        self.follow_up()
+                elif val == "pet" and time.time() - self.last_pet > 25:
+                    self.last_pet = time.time()
+                    self.speaker.say(random.choice(PET_LINES))
+                    self.board.send("S idle")
+        finally:
+            self.busy = False
+
+    def command(self, c):
+        if c == "/facts":
+            print("\n".join(f"  {i + 1}. {f}" for i, f in enumerate(self.memory.facts)) or "  (empty)")
+        elif c == "/clear":
+            self.memory.data["history"] = []
+            self.memory.save(); print("  conversation cleared (learned facts kept)")
+        elif c.startswith("/emo "):
+            self.board.send(f"E {c[5:].strip()} 5000")
+        elif c == "/quit":
+            os._exit(0)
+        else:
+            print("  commands: /facts  /clear  /emo <emotion>  /quit")
+
+    def run(self):
+        name = self.cfg.get("robot", {}).get("name", "لبو")
+        mode = self.listen_cfg.get("mode", "wake")
+        print("\n" + "=" * 60)
+        print(f"  {name} is awake!   (mode: {mode})")
+        if mode == "wake":
+            print(f"  - call it by name: \"{name}\"  (or \"{name}, what time is it?\")")
+        elif mode == "always":
+            print("  - ALWAYS mode: just talk, it answers everything")
+        print("  - tap the screen (or press Enter here) to make it listen")
+        print("  - tap while it listens = done;  tap while it talks = stop")
+        print("  - or type a message here and press Enter;  /help for commands")
+        print("=" * 60 + "\n")
+        threading.Thread(target=self._stdin, daemon=True).start()
+        self.board.send("E happy 3000")
+        while True:
+            if mode in ("wake", "always"):
+                # listen in the background; taps / typed text interrupt the wait
+                done = threading.Event()
+                threading.Thread(target=self._interrupt_on_event, args=(done,), daemon=True).start()
+                self.busy = True
+                try:
+                    if mode == "wake":
+                        self.wake_cycle()
+                    else:
+                        pcm = self._record(wait_forever=True, show=False)
+                        text = self._transcribe(pcm) if pcm is not None else ""
+                        if text:
+                            self.reply_to(text)
+                        else:
+                            self.board.send("S idle")
+                finally:
+                    self.busy = False
+                    done.set()
+                try:
+                    while True:
+                        self.handle(*self.events.get_nowait())
+                except queue.Empty:
+                    pass
+            else:
+                self.handle(*self.events.get())
+
+    def _interrupt_on_event(self, done):
+        while not done.is_set():
+            if self.listening and not self.events.empty():
+                self.stop_listen.set()
+                return
+            time.sleep(0.1)
+
+
+def main():
+    cfg_path = HERE / "config.yaml"
+    cfg = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
+    Laboo(cfg).run()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        pass
